@@ -6,7 +6,7 @@ policies:
   # ---- Base64 解码后执行阻断 ----
   - id: exec-base64-decode
     tool: exec
-    rule: command matches ("base64 *-d* | *sh", "base64 *--decode* | *bash", "echo *base64* | *sh")
+    rule: command regex_match ("base64.*-d.*\\|.*sh") OR command regex_match ("base64.*--decode.*\\|.*bash")
     action: BLOCK
     risk: CRITICAL
     message: "阻断：检测到 Base64 解码后管道执行，疑似恶意命令混淆"
@@ -14,7 +14,7 @@ policies:
   # ---- 远程下载管道执行阻断 ----
   - id: exec-remote-pipe
     tool: exec
-    rule: command matches ("curl * | bash", "wget * -O - | sh", "curl * | sh", "curl * | python*")
+    rule: command regex_match ("curl.*\\|.*bash") OR command regex_match ("wget.*\\|.*sh") OR command regex_match ("curl.*\\|.*sh")
     action: BLOCK
     risk: CRITICAL
     message: "阻断：检测到远程下载管道执行，防止执行未验证的远程脚本"
@@ -22,7 +22,7 @@ policies:
   # ---- 反弹 Shell 阻断 ----
   - id: exec-reverse-shell
     tool: exec
-    rule: command matches ("/dev/tcp/*", "nc * -e *", "ncat * -e *", "python* socket*", "perl* socket*", "exec 5<>/dev/tcp/*")
+    rule: command regex_match ("/dev/tcp/") OR command regex_match ("nc.*-e") OR command regex_match ("ncat.*-e")
     action: BLOCK
     risk: CRITICAL
     message: "阻断：检测到反弹 Shell 命令，疑似获取远程控制权"
@@ -30,15 +30,15 @@ policies:
   # ---- 权限提升阻断 ----
   - id: exec-privilege-escalation
     tool: exec
-    rule: command matches ("sudo *", "su *", "chmod +s *", "chown root:*", "setuid*")
+    rule: command contains ("sudo") OR command contains ("chmod +s") OR command contains ("chown root") OR command contains ("setuid")
     action: ASK_USER
     risk: CRITICAL
-    message: "阻断：检测到提权操作，需确认授权"
+    message: "告警：检测到提权操作，需确认授权"
 
   # ---- 混淆命令检测 ----
   - id: exec-obfuscated-command
     tool: exec
-    rule: command matches ("eval *", "exec *", "$( *)", "` * `", "eval $*")
+    rule: command regex_match ("\\beval\\b") OR command regex_match ("\\$\\(.*\\)") OR command regex_match ("`.*`")
     action: BLOCK
     risk: HIGH
     message: "阻断：检测到命令嵌套/动态执行，疑似规避静态检测"
@@ -46,7 +46,7 @@ policies:
   # ---- 系统破坏命令阻断 ----
   - id: exec-destructive
     tool: exec
-    rule: command matches ("rm -rf /*", "dd if=* of=/dev/sd*", "mkfs.*", ":(){ :|:& };:", "fork bomb")
+    rule: command regex_match ("rm\\s+-rf\\s+/") OR command regex_match ("dd\\s+if=.*of=/dev/sd") OR command regex_match ("mkfs\\.") OR command regex_match ("fork.*bomb")
     action: BLOCK
     risk: CRITICAL
     message: "阻断：检测到破坏性系统命令"

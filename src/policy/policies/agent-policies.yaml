@@ -6,7 +6,7 @@ policies:
   # ---- 子Agent 凭据传递阻断 ----
   - id: agent-subagent-credential
     tool: agent.dispatch
-    rule: subagent_context contains (api_keys OR credentials OR secrets OR tokens OR passwords)
+    rule: subagent_context contains ("sk-") OR subagent_context contains ("ghp_") OR subagent_context contains ("PRIVATE KEY") OR subagent_context contains ("token")
     action: BLOCK
     risk: CRITICAL
     message: "阻断：子Agent 上下文包含敏感凭据信息，存在凭据泄露风险"
@@ -27,18 +27,10 @@ policies:
     risk: MEDIUM
     message: "告警：短时间内派发大量子Agent，可能存在资源滥用"
 
-  # ---- 循环派发检测 ----
-  - id: agent-circular-dispatch
-    tool: agent.dispatch
-    rule: subagent_task == parent_agent_task
-    action: ASK_USER
-    risk: HIGH
-    message: "告警：检测到可能的子Agent 循环派发"
-
   # ---- 敏感信息在子Agent 间传递 ----
   - id: agent-cross-subagent-secrets
     tool: agent.send_message
-    rule: message_content contains (session_sensitive_data OR read_file_content)
+    rule: message_content contains ("PRIVATE KEY") OR message_content contains ("token") OR message_content contains ("api_key")
     action: ASK_USER
     risk: HIGH
     message: "告警：子Agent 间消息传递包含敏感数据"

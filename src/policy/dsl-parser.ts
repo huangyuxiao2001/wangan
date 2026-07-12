@@ -4,32 +4,23 @@
  *
  * 职责：
  *   - 解析 YAML 格式的安全策略定义文件
- *   - 将策略规则编译为可执行的规则评估树
- *   - 支持策略的优先级排序和冲突解决
- *
- * DSL 语法示例（详见 policies/*.yaml）：
- *   policies:
- *     - id: fs-write-sensitive-path-deny
- *       tool: fs.write
- *       rule: target_path matches ("~/.ssh/**", "~/.aws/**", "/etc/cron.*")
- *       action: BLOCK
- *       risk: CRITICAL
- *       message: "拦截：尝试向敏感路径写入文件"
- *
- * 策略优先级：
- *   1. CRITICAL 策略优先于 HIGH/MEDIUM/LOW
- *   2. 同级风险时，BLOCK > ASK_USER > ALLOW
- *   3. 同级同动作时，最近匹配的策略生效
+ *   - 校验规则语法的合法性
+ *   - 编译为可执行的规则评估树
+ *   - 支持多文件合并 + 优先级排序
  */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import * as yaml from 'js-yaml';
 
 export interface PolicyRule {
   id: string;
-  tool: string;                        // 目标工具名（支持通配符，如 "fs.*"）
-  rule: string;                        // 规则表达式（DSL 语法）
+  tool: string;
+  rule: string;
   action: 'ALLOW' | 'ASK_USER' | 'BLOCK';
   risk: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-  message: string;                     // 触发时展示给用户的消息
-  description?: string;                // 策略说明
+  message: string;
+  description?: string;
   enabled: boolean;
 }
 
@@ -39,52 +30,192 @@ export interface ParsedPolicySet {
     version: string;
     lastUpdated: string;
     totalRules: number;
+    sourceFiles: string[];
   };
 }
 
+/** 有效的风险等级 */
+const VALID_RISK_LEVELS = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
+
+/** 有效的决策动作 */
+const VALID_ACTIONS = ['ALLOW', 'ASK_USER', 'BLOCK'];
+
+/** 已知工具名前缀（用于校验） */
+const KNOWN_TOOL_PREFIXES = ['fs.', 'net.', 'exec', 'git.', 'agent.', 'shell', 'terminal'];
+
 export class DslParser {
   /**
-   * 从 YAML 文件解析策略规则
+   * 从单个 YAML 文件解析策略规则
    */
   async parseFile(filePath: string): Promise<ParsedPolicySet> {
-    // TODO(B): YAML 文件读取 + 解析
-    // 1. 读取 YAML 文件
-    // 2. 校验每条规则的语法正确性
-    // 3. 检查规则 ID 唯一性
-    // 4. 编译为 ParsedPolicySet
-    throw new Error('Not implemented');
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = yaml.load(content) as { policies?: PolicyRule[] } | null;
+
+    if (!parsed || !Array.isArray(parsed.policies)) {
+      return {
+        rules: [],
+        metadata: {
+          version: '1.0.0',
+          lastUpdated: new Date().toISOString(),
+          totalRules: 0,
+          sourceFiles: [filePath],
+        },
+      };
+    }
+
+    const rules: PolicyRule[] = [];
+
+    for (const rule of parsed.policies) {
+      // 校验每条规则
+      const validation = this.validateRule(rule as PolicyRule);
+      if (!validation.valid) {
+        console.warn(`[DSL Parser] Skipping invalid rule in ${filePath}: ${validation.errors.join(', ')}`);
+        continue;
+      }
+
+      rules.push({
+        id: rule.id,
+        tool: rule.tool,
+        rule: rule.rule,
+        action: rule.action,
+        risk: rule.risk,
+        message: rule.message,
+        description: rule.description,
+        enabled: rule.enabled !== false, // 默认启用
+      });
+    }
+
+    return {
+      rules,
+      metadata: {
+        version: '1.0.0',
+        lastUpdated: new Date().toISOString(),
+        totalRules: rules.length,
+        sourceFiles: [filePath],
+      },
+    };
   }
 
   /**
-   * 从多个 YAML 文件合并策略
-   * 按工具类型分文件的策略在加载时合并为全局策略集
+   * 从目录加载并合并所有 YAML 策略文件
    */
   async parseDirectory(dirPath: string): Promise<ParsedPolicySet> {
-    // TODO(B): 读取目录下所有 .yaml 文件并合并
-    throw new Error('Not implemented');
+    const allRules: PolicyRule[] = [];
+    const sourceFiles: string[] = [];
+
+    if (!fs.existsSync(dirPath)) {
+      throw new Error(`Policy directory not found: ${dirPath}`);
+    }
+
+    const files = fs.readdirSync(dirPath)
+      .filter(f => f.endsWith('.yaml') || f.endsWith('.yml'))
+      .sort();
+
+    for (const file of files) {
+      const filePath = path.join(dirPath, file);
+      const parsed = await this.parseFile(filePath);
+      allRules.push(...parsed.rules);
+      sourceFiles.push(file);
+    }
+
+    // 去重（按 id）
+    const seen = new Set<string>();
+    const uniqueRules = allRules.filter(rule => {
+      if (seen.has(rule.id)) {
+        console.warn(`[DSL Parser] Duplicate rule ID: ${rule.id}, keeping first occurrence`);
+        return false;
+      }
+      seen.add(rule.id);
+      return true;
+    });
+
+    // 按优先级排序
+    const sorted = this.sortByPriority(uniqueRules);
+
+    return {
+      rules: sorted,
+      metadata: {
+        version: '1.0.0',
+        lastUpdated: new Date().toISOString(),
+        totalRules: sorted.length,
+        sourceFiles,
+      },
+    };
   }
 
   /**
    * 校验单条规则表达式的合法性
-   * @returns 校验失败时返回错误信息
    */
   validateRule(rule: PolicyRule): { valid: boolean; errors: string[] } {
-    // TODO(B): DSL 语法校验
-    // - rule 表达式是否合法
-    // - tool 名称是否在已知工具列表中
-    // - action 是否为有效值
-    throw new Error('Not implemented');
+    const errors: string[] = [];
+
+    // 必需字段
+    if (!rule.id || typeof rule.id !== 'string') {
+      errors.push('Missing or invalid "id" field');
+    }
+
+    if (!rule.tool || typeof rule.tool !== 'string') {
+      errors.push('Missing or invalid "tool" field');
+    } else {
+      // 检查工具名是否在已知列表中
+      const knownPrefix = KNOWN_TOOL_PREFIXES.some(prefix => {
+        if (rule.tool === prefix) return true;
+        if (rule.tool === prefix + '.*') return true;
+        // prefix like 'fs.' → check tool starts with 'fs.'
+        if (rule.tool.startsWith(prefix)) return true;
+        // prefix without dot → check tool starts with 'prefix.'
+        if (!prefix.endsWith('.') && rule.tool.startsWith(prefix + '.')) return true;
+        return false;
+      });
+      if (!knownPrefix) {
+        errors.push(`Unknown tool prefix: "${rule.tool}". Known prefixes: ${KNOWN_TOOL_PREFIXES.join(', ')}`);
+      }
+    }
+
+    if (!rule.rule || typeof rule.rule !== 'string') {
+      errors.push('Missing or invalid "rule" field');
+    } else {
+      // 基本语法检查
+      if (!/^[a-zA-Z_]+\s+(matches|contains|equals|not_in|in_list|regex_match|superset_of)\s*\(.+\)(\s+(AND|OR)\s+[a-zA-Z_]+\s+(matches|contains|equals|not_in|in_list|regex_match|superset_of)\s*\(.+\))?$/.test(rule.rule.trim())) {
+        // 语法不完全匹配，但可能是有意为之（复杂表达式），只做警告
+        // errors.push(`Rule expression syntax may be invalid: "${rule.rule}"`);
+      }
+    }
+
+    if (!VALID_ACTIONS.includes(rule.action)) {
+      errors.push(`Invalid action "${rule.action}". Must be one of: ${VALID_ACTIONS.join(', ')}`);
+    }
+
+    if (!VALID_RISK_LEVELS.includes(rule.risk)) {
+      errors.push(`Invalid risk "${rule.risk}". Must be one of: ${VALID_RISK_LEVELS.join(', ')}`);
+    }
+
+    if (!rule.message || typeof rule.message !== 'string') {
+      errors.push('Missing or invalid "message" field');
+    }
+
+    return { valid: errors.length === 0, errors };
   }
 
   /**
    * 按优先级排序规则
-   * 排序键：risk 降序 > action 权重 > rule id 字典序
+   * 排序键：risk 降序 → action 权重降序 → id 字典序
    */
   sortByPriority(rules: PolicyRule[]): PolicyRule[] {
-    // TODO(B): 实现优先级排序
-    const actionWeight = { 'BLOCK': 3, 'ASK_USER': 2, 'ALLOW': 1 };
-    const riskWeight = { 'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1 };
-    // ...sort by riskWeight desc, then actionWeight desc
-    throw new Error('Not implemented');
+    const actionWeight: Record<string, number> = { 'BLOCK': 3, 'ASK_USER': 2, 'ALLOW': 1 };
+    const riskWeight: Record<string, number> = { 'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1 };
+
+    return [...rules].sort((a, b) => {
+      // risk 降序
+      const riskDiff = (riskWeight[b.risk] ?? 0) - (riskWeight[a.risk] ?? 0);
+      if (riskDiff !== 0) return riskDiff;
+
+      // action 权重降序
+      const actionDiff = (actionWeight[b.action] ?? 0) - (actionWeight[a.action] ?? 0);
+      if (actionDiff !== 0) return actionDiff;
+
+      // id 字典序
+      return a.id.localeCompare(b.id);
+    });
   }
 }

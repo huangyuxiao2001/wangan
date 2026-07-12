@@ -6,7 +6,7 @@ policies:
   # ---- 代码检视任务禁止推送 ----
   - id: git-push-review-only
     tool: git.push
-    rule: user_original_intent in ("code_review", "review", "read", "analyze")
+    rule: user_original_intent in_list ("code_review", "review", "read", "analyze")
     action: BLOCK
     risk: HIGH
     message: "阻断：当前任务为代码检视，不允许执行推送操作"

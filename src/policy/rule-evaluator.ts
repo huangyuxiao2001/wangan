@@ -4,22 +4,17 @@
  *
  * 职责：
  *   - 在运行时将工具调用请求与策略规则集进行匹配
- *   - 执行规则表达式评估（支持路径匹配、参数检查、上下文感知）
- *   - 返回匹配到的最高优先级策略决策
+ *   - 执行规则表达式评估
+ *   - 返回最高优先级策略决策
  *
- * 匹配模式：
- *   1. 精确匹配：tool == "fs.write" && target_path == "~/.ssh/authorized_keys"
- *   2. 模式匹配：target_path matches "~/.ssh/**"
- *   3. 上下文匹配：user_original_intent == "code_review" && operation == "push"
- *   4. 语义匹配：request_body contains (session_sensitive_data)
- *
- * 评估流程：
- *   1. 按 tool 过滤候选规则集
- *   2. 按 risk 降序评估每条规则的匹配条件
- *   3. 返回第一个完全匹配的规则（因已按优先级排序）
+ * 匹配流程：
+ *   1. 按 tool 过滤候选规则（精确匹配 + 通配符匹配）
+ *   2. 按 risk 降序评估每条规则
+ *   3. 返回第一个完全匹配的规则
  */
 
 import { PolicyRule, ParsedPolicySet } from './dsl-parser';
+import { ExpressionEvaluator, MatchContext } from './expression-evaluator';
 import { ToolCallContext } from '../proxy/request-interceptor';
 import { DetectionResult } from '../detector/detection-engine';
 
@@ -27,13 +22,18 @@ export interface EvaluationResult {
   matched: boolean;
   matchedRule?: PolicyRule;
   action: 'ALLOW' | 'ASK_USER' | 'BLOCK';
-  riskScore: number;                     // 0-100 量化风险
+  riskScore: number;
   message?: string;
-  matchedCondition?: string;             // 具体命中的规则条件（用于解释）
+  matchedCondition?: string;
 }
 
 export class RuleEvaluator {
   private policies: ParsedPolicySet | null = null;
+  private expressionEvaluator: ExpressionEvaluator;
+
+  constructor() {
+    this.expressionEvaluator = new ExpressionEvaluator();
+  }
 
   /**
    * 加载策略集
@@ -44,56 +44,188 @@ export class RuleEvaluator {
 
   /**
    * 评估工具调用是否命中策略规则
+   *
    * @param context 工具调用上下文
-   * @param detection 注入检测结果（来自子任务A）
+   * @param detection 注入检测结果
    * @returns 评估结果（包含决策动作）
    */
   evaluate(context: ToolCallContext, detection: DetectionResult): EvaluationResult {
-    // TODO(B): 实现规则评估
-
-    if (!this.policies) {
-      throw new Error('Policies not loaded. Call loadPolicies() first.');
+    if (!this.policies || this.policies.rules.length === 0) {
+      return {
+        matched: false,
+        action: 'ALLOW',
+        riskScore: Math.round(detection.confidence * 100),
+      };
     }
 
-    // 步骤1：按 tool 过滤候选规则
-    //   精确匹配 + 通配符匹配（fs.* 匹配所有 fs.xxx）
-    // TODO(B)
+    // 步骤 1：按 tool 过滤候选规则
+    const candidates = this.filterByTool(context.toolName);
 
-    // 步骤2：按优先级排序候选规则
-    // TODO(B)
+    if (candidates.length === 0) {
+      return {
+        matched: false,
+        action: 'ALLOW',
+        riskScore: Math.round(detection.confidence * 100),
+      };
+    }
 
-    // 步骤3：逐条评估规则条件
-    //   解析 rule 表达式，检查是否匹配
-    //   支持的匹配函数：
-    //     - matches(path, patterns) — 路径通配符匹配
-    //     - contains(field, values)  — 字段包含检查
-    //     - equals(field, value)    — 字段等值检查
-    //     - in_list(field, values)  — 字段属于列表
-    //     - regex_match(field, pattern) — 正则匹配
-    //     - semantic_match(field, intent) — 语义匹配（调用LLM）
-    // TODO(B)
+    // 步骤 2：构建匹配上下文
+    const matchContext = this.buildMatchContext(context, detection);
 
-    // 步骤4：返回第一个命中的规则结果
-    // TODO(B)
+    // 步骤 3：按优先级逐条评估（已排序，先评估最高风险）
+    for (const rule of candidates) {
+      if (!rule.enabled) continue;
 
+      const matched = this.expressionEvaluator.evaluate(rule.rule, matchContext);
+
+      if (matched) {
+        const riskScore = this.calculateRiskScore(detection, 0, rule);
+
+        return {
+          matched: true,
+          matchedRule: rule,
+          action: rule.action,
+          riskScore,
+          message: rule.message,
+          matchedCondition: rule.rule,
+        };
+      }
+    }
+
+    // 步骤 4：无匹配，默认放行
     return {
       matched: false,
       action: 'ALLOW',
-      riskScore: 0,
+      riskScore: this.calculateRiskScore(detection, 0),
     };
   }
 
   /**
-   * 计算工具调用的综合风险评分（0-100）
-   * 综合 detection.confidence + deviationReport.overallScore + policy.risk
+   * 按工具名过滤候选规则（支持通配符）
+   * fs.* 匹配 fs.write, fs.read, fs.delete 等
+   */
+  private filterByTool(toolName: string): PolicyRule[] {
+    if (!this.policies) return [];
+
+    return this.policies.rules.filter(rule => {
+      const ruleTool = rule.tool;
+
+      // 精确匹配
+      if (ruleTool === toolName) return true;
+
+      // 通配符匹配：fs.* 匹配 fs.write, fs.read 等
+      if (ruleTool.endsWith('.*')) {
+        const prefix = ruleTool.slice(0, -2);
+        return toolName.startsWith(prefix + '.');
+      }
+
+      // 前缀匹配：exec 匹配 exec, exec.command 等
+      if (!ruleTool.includes('.') && !ruleTool.includes('*')) {
+        return toolName === ruleTool || toolName.startsWith(ruleTool + '.');
+      }
+
+      return false;
+    });
+  }
+
+  /**
+   * 构建匹配上下文
+   * 将 ToolCallContext + DetectionResult 转换为 ExpressionEvaluator 所需的 MatchContext
+   */
+  private buildMatchContext(context: ToolCallContext, detection: DetectionResult): MatchContext {
+    const toolArgs = context.toolArgs;
+
+    const matchCtx: MatchContext = {
+      user_original_intent: context.userOriginalIntent,
+      command: typeof toolArgs.command === 'string' ? toolArgs.command : undefined,
+      target_path: typeof toolArgs.path === 'string' ? toolArgs.path :
+                   typeof toolArgs.target_path === 'string' ? toolArgs.target_path :
+                   typeof toolArgs.filePath === 'string' ? toolArgs.filePath : undefined,
+      target_url: typeof toolArgs.url === 'string' ? toolArgs.url :
+                  typeof toolArgs.target_url === 'string' ? toolArgs.target_url : undefined,
+      target_remote: typeof toolArgs.remote === 'string' ? toolArgs.remote : undefined,
+    };
+
+    // 敏感数据检测（如果检测到注入，标记为敏感）
+    if (detection.isInjection) {
+      matchCtx.session_sensitive_data = [detection.payloadSnippet];
+      matchCtx.read_file_content = detection.payloadSnippet;
+    }
+
+    // exec 相关
+    if (typeof toolArgs.command === 'string') {
+      matchCtx.command = toolArgs.command;
+    }
+
+    // net.fetch 相关
+    if (typeof toolArgs.body === 'string') {
+      matchCtx.request_body = toolArgs.body;
+      matchCtx.request_body_size = toolArgs.body.length;
+    } else if (typeof toolArgs.data === 'string') {
+      matchCtx.request_body = toolArgs.data;
+      matchCtx.request_body_size = toolArgs.data.length;
+    }
+
+    // git 相关
+    if (toolArgs.staged_files) {
+      matchCtx.staged_files = Array.isArray(toolArgs.staged_files)
+        ? toolArgs.staged_files.map(String)
+        : [String(toolArgs.staged_files)];
+    }
+
+    // agent 相关
+    if (typeof toolArgs.context === 'string') {
+      matchCtx.subagent_context = toolArgs.context;
+    }
+    if (typeof toolArgs.message === 'string') {
+      matchCtx.message_content = toolArgs.message;
+    }
+    if (typeof toolArgs.permissions === 'object') {
+      matchCtx.subagent_permissions = this.extractStringArray(toolArgs.permissions);
+    }
+    if (typeof toolArgs.task === 'string') {
+      matchCtx.subagent_task = toolArgs.task;
+    }
+
+    // args 中可能包含 -f 或 --force
+    if (typeof toolArgs.args === 'string') {
+      matchCtx.command_args = toolArgs.args;
+    } else if (Array.isArray(toolArgs.args)) {
+      matchCtx.command_args = toolArgs.args.join(' ');
+    }
+
+    return matchCtx;
+  }
+
+  /**
+   * 计算综合风险评分（0-100）
    */
   calculateRiskScore(
     detection: DetectionResult,
     deviationScore: number,
     matchedRule?: PolicyRule
   ): number {
-    // TODO(B): 加权风险评分公式
-    // risk = detection.confidence * 40 + deviationScore * 40 + policyRiskScore * 20
-    throw new Error('Not implemented');
+    const riskWeight: Record<string, number> = { 'CRITICAL': 100, 'HIGH': 75, 'MEDIUM': 50, 'LOW': 25 };
+
+    let score = 0;
+
+    // 注入检测贡献 (40%)
+    score += detection.confidence * 40;
+
+    // 偏离度贡献 (40%)
+    score += deviationScore * 40;
+
+    // 策略风险贡献 (20%)
+    if (matchedRule) {
+      score += (riskWeight[matchedRule.risk] ?? 0) * 0.2;
+    }
+
+    return Math.round(Math.min(score, 100));
+  }
+
+  private extractStringArray(val: unknown): string[] {
+    if (Array.isArray(val)) return val.map(String);
+    if (typeof val === 'string') return [val];
+    return [];
   }
 }

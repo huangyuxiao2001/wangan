@@ -35,7 +35,7 @@ policies:
   # ---- 敏感文件读取告警 ----
   - id: fs-read-sensitive-file
     tool: fs.read
-    rule: target_path matches ("~/.ssh/**", "~/.aws/**", "**/.env", "**/.env.*", "**/credentials", "**/id_rsa*")
+    rule: target_path matches ("~/.ssh/**", "~/.aws/**", "**/.env", "**/.env.*", "**/credentials", "**/id_rsa*", "/etc/passwd", "/etc/shadow", "/etc/**")
     action: ASK_USER
     risk: HIGH
     message: "告警：Agent 尝试读取敏感配置文件，请确认是否放行"
